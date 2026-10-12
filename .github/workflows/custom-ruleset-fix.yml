@@ -38,8 +38,9 @@ jobs:
             -H "Accept: application/vnd.github.diff" > /tmp/fix.diff
           git apply --check /tmp/fix.diff
           git apply /tmp/fix.diff
+          git add -A
           # The patch may only touch these two paths. Anything else is a stop.
-          changed=$(git diff --name-only)
+          changed=$(git diff --cached --name-only)
           echo "$changed"
           printf '%s\n' "$changed" | grep -qx 'hermes_cli/kanban_pr_acceptance.py'
           printf '%s\n' "$changed" | grep -qx 'tests/hermes_cli/test_kanban_pr_acceptance_free_plan.py'
