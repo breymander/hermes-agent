@@ -1,0 +1,131 @@
+name: custom-ruleset-fix image
+
+# One-shot builder for the Bryan-approved custom image.
+# Image contents are upstream main + NousResearch/hermes-agent#136830
+# (887937c9) only. This workflow file is not in the build context.
+on:
+  push:
+    branches: [custom-ruleset-fix-builder]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: custom-ruleset-fix-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/breymander/hermes-agent
+  PATCH_SHA: 887937c9eb82aab98e1043cbece2fdb7e5d1d32d
+
+jobs:
+  build-arm64:
+    name: Build arm64 custom image
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - name: Clone upstream main and apply only the rulesets-403 patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch main https://github.com/NousResearch/hermes-agent.git /tmp/src
+          cd /tmp/src
+          echo "upstream_main=$(git rev-parse HEAD)" | tee /tmp/build-identity.txt
+          gh api "repos/NousResearch/hermes-agent/commits/${PATCH_SHA}" \
+            -H "Accept: application/vnd.github.diff" > /tmp/fix.diff
+          git apply --check /tmp/fix.diff
+          git apply /tmp/fix.diff
+          # The patch may only touch these two paths. Anything else is a stop.
+          changed=$(git diff --name-only)
+          echo "$changed"
+          printf '%s\n' "$changed" | grep -qx 'hermes_cli/kanban_pr_acceptance.py'
+          printf '%s\n' "$changed" | grep -qx 'tests/hermes_cli/test_kanban_pr_acceptance_free_plan.py'
+          test "$(printf '%s\n' "$changed" | wc -l)" -eq 2
+          grep -q '_branch_rules' hermes_cli/kanban_pr_acceptance.py
+          grep -q 'rulesets_unavailable' hermes_cli/kanban_pr_acceptance.py
+          echo "patch=${PATCH_SHA}" | tee -a /tmp/build-identity.txt
+          # Provenance only. Upstream CI writes this before docker build; the
+          # Dockerfile copies it. Not a code change.
+          python3 - <<'PY'
+          import json, pathlib
+          ident = dict(line.split("=", 1) for line in pathlib.Path("/tmp/build-identity.txt").read_text().splitlines())
+          pathlib.Path("install-stamp.json").write_text(json.dumps({
+              "schemaVersion": 2,
+              "commit": ident["upstream_main"],
+              "distribution": "docker",
+              "source": "custom-ruleset-fix",
+              "updateMechanism": "external",
+          }) + "\n")
+          PY
+
+      - name: Show disk before build
+        run: df -h
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build linux/arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/src
+          file: /tmp/src/Dockerfile
+          platforms: linux/arm64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: ${{ env.IMAGE }}:custom-ruleset-fix
+          build-args: |
+            HERMES_BOT_DESKTOP=0
+          labels: |
+            org.opencontainers.image.source=https://github.com/NousResearch/hermes-agent
+            org.opencontainers.image.revision=${{ env.PATCH_SHA }}
+            org.opencontainers.image.description=upstream main plus cherry-pick 887937c9 (NousResearch/hermes-agent#136830) only
+
+      - name: Smoke the patched gate and the architecture
+        run: |
+          set -euo pipefail
+          arch=$(docker image inspect --format '{{.Architecture}}' "${IMAGE}:custom-ruleset-fix")
+          echo "architecture=${arch}"
+          test "$arch" = "arm64"
+          docker run --rm --entrypoint grep "${IMAGE}:custom-ruleset-fix" \
+            -q '_branch_rules' /opt/hermes/hermes_cli/kanban_pr_acceptance.py
+          docker run --rm --entrypoint grep "${IMAGE}:custom-ruleset-fix" \
+            -q 'rulesets_unavailable' /opt/hermes/hermes_cli/kanban_pr_acceptance.py
+          # The running chart passes these args to the image entrypoint.
+          docker run --rm --entrypoint test "${IMAGE}:custom-ruleset-fix" \
+            -x /opt/hermes/docker/entrypoint-dispatch.sh
+
+      - name: Push custom tags
+        run: |
+          set -euo pipefail
+          docker tag "${IMAGE}:custom-ruleset-fix" "${IMAGE}:custom-ruleset-fix-${PATCH_SHA:0:12}"
+          docker push "${IMAGE}:custom-ruleset-fix"
+          docker push "${IMAGE}:custom-ruleset-fix-${PATCH_SHA:0:12}"
+          docker image inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:custom-ruleset-fix" || true
+
+      - name: Prove an anonymous pull can read the arm64 tag
+        run: |
+          set -euo pipefail
+          # Publishing token can see a private package. The cluster pod has no
+          # imagePullSecret, so the tag must be readable with an anonymous token.
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?service=ghcr.io&scope=repository:breymander/hermes-agent:pull" | jq -r .token)
+          test -n "$TOKEN" && test "$TOKEN" != "null"
+          curl -fsSL \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/breymander/hermes-agent/manifests/custom-ruleset-fix" \
+            -o /tmp/manifest.json
+          jq -e 'if .manifests then any(.manifests[]; .platform.architecture=="arm64" and .platform.os=="linux") else (.architecture=="arm64" or .config.architecture=="arm64") end' /tmp/manifest.json
+          echo "anonymous_arm64_manifest=ok"
+          cat /tmp/build-identity.txt
